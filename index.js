@@ -5,11 +5,7 @@ const takeLock = () => {
 	lock = new Promise(resolve => { releaseLock = resolve; lock = { then: f => f() }; });
 };
 
-const pauseEventSystem = () => takeLock();
-const unpauseEventSystem = () => releaseLock();
-
 const makeEvent = (on = () => () => {}) => {
-	let ignorePauses = false
 	// TODO
 	// maybe use this for a perf optimization
 	// unused for now for simplicity
@@ -38,13 +34,8 @@ const makeEvent = (on = () => () => {}) => {
 		};
 	};
 	const consume = f => listen(f)();
-	const pushRaw = (a) => {
-		ons.forEach(id => subs[id](a));
-	};
 	const push = (a) => {
-		return ignorePauses ? pushRaw(a) : ( 
-			lock.then(() => pushRaw(a))
-		)
+		ons.forEach(id => subs[id](a));
 	};
 
 	const helper = (f) => {
@@ -106,7 +97,6 @@ const makeEvent = (on = () => () => {}) => {
 				}
 			};
 		});
-		e.ignorePauses();
 		return e;
 	};
 
@@ -118,7 +108,6 @@ const makeEvent = (on = () => () => {}) => {
 		filter,
 		reduce,
 		flatMap,
-		ignorePauses: () => { ignorePauses = true },
 	};
 };
 
@@ -138,7 +127,6 @@ const adaptEvent = (sub, unsub) => {
 			}
 		};
 	});
-	e.ignorePauses();
 	return e;
 };
 
@@ -159,11 +147,10 @@ const joinEvents = (...events) => {
 			}
 		};
 	});
-	e.ignorePauses();
 	return e;
 };
 
-const makeSignal = (event, init, lazy = false) => {
+const makeSignal = (event, init) => {
 	let off = () => false;
 	let val = init;
 	const changed = event
@@ -200,43 +187,38 @@ const makeSignal = (event, init, lazy = false) => {
 			val,
 		)
 	);
-	const fmap = (f, lazy = false) => makeSignal(changed.fmap(f), f(val), lazy);
-	const flatMap = (fs, lazy = false) => {
+	const fmap = (f) => makeSignal(changed.fmap(f), f(val));
+	const flatMap = (fs) => {
 		const initS = fs(val);
 		const init = initS.getVal();
 		const initChanged = initS.changed;
 		const changes = changed.fmap(inner => fs(inner).getVal());
 		const updates = changed.flatMap(inner => fs(inner).changed);
 		const event = joinEvents(initChanged, changes, updates);
-		return makeSignal(event, init, lazy);
+		return makeSignal(event, init);
 	};
 
-	if (!lazy) {
-		consume(() => {});
-	}
+	consume(() => {});
 	return {
-		...(lazy ? { consume } : { off, consume }),
+		off,
+		consume,
 		getVal,
 		changed,
 		tagEvent,
 		dedup,
 		fmap,
 		flatMap,
-		ignorePauses: () => { changed.ignorePauses(); event.ignorePauses(); }
 	};
 };
 
-const zipWith = (lazy) => (f, ...signals) => {
+const zipWith = (f, ...signals) => {
 	const getVal = () => f(...signals.map(s => s.getVal()));
 	const event = joinEvents(...signals.map(s => s.changed)).fmap(getVal);
-	return makeSignal(event, getVal(), lazy);
+	return makeSignal(event, getVal());
 };
 
 exports.makeEvent = makeEvent;
 exports.makeSignal = makeSignal;
 exports.joinEvents = joinEvents;
 exports.adaptEvent = adaptEvent;
-exports.zipWith = zipWith(false);
-exports.zipWithLazy = zipWith(true);
-exports.pauseEventSystem = pauseEventSystem;
-exports.unpauseEventSystem = unpauseEventSystem;
+exports.zipWith = zipWith;

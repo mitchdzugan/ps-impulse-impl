@@ -16,8 +16,13 @@ const makeEvent = (on = () => () => {}) => {
 	// for now for simplicity.
 	// let error = undefined;
 	let nextSubId = 0;
-	const ons = new Set();
-	const subs = {};
+	let ons = new Set();
+	let subs = {};
+
+	const clear = () => {
+		ons = new Set();
+		subs = {};
+	};
 
 	const listen = (f) => {
 		const subId = nextSubId++;
@@ -78,9 +83,11 @@ const makeEvent = (on = () => () => {}) => {
 			if (isConsuming) {
 				innerOff();
 			}
-			innerOn = f(inner).listen(v => e.push(v));
+			const ires = f(inner);
+			// TODO what the actual fuck
+			innerOn = ires.listen && ires.listen(v => e.push(v));
 			if (isConsuming) {
-				innerOff = innerOn();
+				innerOff = innerOn ? innerOn() : (() => {});
 			}
 		});
 		e = makeEvent(() => {
@@ -108,6 +115,7 @@ const makeEvent = (on = () => () => {}) => {
 		filter,
 		reduce,
 		flatMap,
+		clear,
 	};
 };
 
@@ -151,23 +159,41 @@ const joinEvents = (...events) => {
 };
 
 const makeSignal = (event, init) => {
+	let isOff = false;
 	let off = () => false;
 	let val = init;
+
+
+	const stateful = { res: {} };
+
 	const changed = event
 		.fmap(v => {
+			if (isOff) {
+				return { skip: true };
+			}
 			if (val == v || val === v) {
 				return { skip: true };
 			}
 			val = v;
 			return { val: v };
 		})
-		.filter(({ skip }) => !skip)
+				.filter(({ skip }) => {
+					if (isOff && !skip) {
+						console.log('isReallyBad');
+					}
+					return !skip ;
+				})
 		.fmap(({ val }) => val);
 
 	const consume = (f) => {
+		isOff = false;
 		const res = f(val);
 		const unwrappedOff = changed.consume(val => f(val));
-		off = () => { unwrappedOff(); return true; };
+		off = () => {
+			isOff = true;
+			unwrappedOff();
+			return true;
+		};
 		return { res, off };
 	};
 
@@ -199,7 +225,7 @@ const makeSignal = (event, init) => {
 	};
 
 	consume(() => {});
-	return {
+	stateful.res = {
 		off,
 		consume,
 		getVal,
@@ -209,6 +235,7 @@ const makeSignal = (event, init) => {
 		fmap,
 		flatMap,
 	};
+	return stateful.res;
 };
 
 const zipWith = (f, ...signals) => {

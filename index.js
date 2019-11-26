@@ -116,6 +116,7 @@ const makeEvent = (on = () => () => {}) => {
 		reduce,
 		flatMap,
 		clear,
+		mapEff: helper
 	};
 };
 

@@ -159,8 +159,12 @@ const joinEvents = (...events) => {
 	return e;
 };
 
+let nextSigId = 0
 const makeSignal = (event, init) => {
-	let isOff = false;
+	const sigId = nextSigId++;
+	let nextConsId = 1;
+	let cons = {};
+	let onCount = 0;
 	let off = () => false;
 	let val = init;
 
@@ -169,7 +173,7 @@ const makeSignal = (event, init) => {
 
 	const changed = event
 		.fmap(v => {
-			if (isOff) {
+			if (onCount === 0) {
 				return { skip: true };
 			}
 			if (val == v || val === v) {
@@ -179,21 +183,37 @@ const makeSignal = (event, init) => {
 			return { val: v };
 		})
 				.filter(({ skip }) => {
-					if (isOff && !skip) {
+					if (onCount === 0 && !skip) {
 						console.log('isReallyBad');
 					}
 					return !skip ;
 				})
 		.fmap(({ val }) => val);
 
+	let unwrappedOff = () => {};
+	const masterCons = val => {
+		Object.values(cons).forEach(f => f(val));
+	};
 	const consume = (f) => {
-		isOff = false;
+		const consId = nextConsId++;
+		cons[consId] = f;
+		onCount += 1;
 		const res = f(val);
-		const unwrappedOff = changed.consume(val => f(val));
+		// console.log({ onCount, sigId, consId });
+		if (onCount === 1) {
+			// console.log('on!!', { onCount, sigId, consId });
+			unwrappedOff = changed.consume(masterCons);
+		}
 		off = () => {
-			isOff = true;
-			unwrappedOff();
-			return true;
+			onCount -= 1;
+			delete cons[consId];
+			// console.log({ onCount, sigId, consId });
+			if (onCount === 0) {
+				// console.log('off!!', { onCount, sigId, consId });
+				unwrappedOff();
+				return true;
+			}
+			return false;
 		};
 		return { res, off };
 	};

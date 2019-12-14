@@ -41,7 +41,7 @@ const consumeJS = (f) => (event) => {
 
 
 // -- mkEvent :: forall a. ((a -> Effect Unit) -> Effect (Effect Unit)) -> Event a
-const mkEvent = (onRequired) => mkEventJS(pushSelf => onRequired(pushSelf)());
+const mkEvent = (onRequired = () => () => () => () => {}) => mkEventJS(pushSelf => onRequired(v => () => pushSelf(v))());
 
 // -- push :: forall a. a -> Event a -> Effect Unit
 const push = (value) => (event) => () => pushJS(value)(event);

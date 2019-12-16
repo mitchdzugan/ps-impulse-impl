@@ -124,14 +124,16 @@ const dedupImpl = (eq) => (event) => {
 	let isFirst = true;
 	let prev;
 	return mkEventJS(
-		(pushSelf) => consumeJS((curr) => {
-			if (isFirst || !eq(prev)(curr)) {
-				pushSelf(curr);
-				prev = curr;
-			}
-			isFirst = false;
-			return () => { isFirst = true; };
-		})(event)
+		(pushSelf) => {
+			const off = consumeJS((curr) => {
+				if (isFirst || !eq(prev)(curr)) {
+					pushSelf(curr);
+					prev = curr;
+				}
+				isFirst = false;
+			})(event);
+			return () => { off(); isFirst = true; };
+		}
 	);
 };
 
@@ -207,19 +209,17 @@ const debounce = (ms) => (event) => {
 // -- throttle :: forall a. Int -> Event a -> Event a
 const throttle = (ms) => (event) => {
 	let timeoutId;
-	let vs = [];
+	let latest;
 	return mkEventJS(
 		(pushSelf) => {
 			const off = consumeJS(
 				(v) => {
-					if (timeoutId) {
-						vs.push(v);
-					} else {
-						vs = [v];
+					latest = v;
+					if (!timeoutId) {
 						timeoutId = setTimeout(
 							() => {
 								timeoutId = null;
-								return pushSelf(vs[0]);
+								return pushSelf(latest);
 							},
 							ms
 						);
@@ -229,7 +229,6 @@ const throttle = (ms) => (event) => {
 			return () => {
 				off();
 				if (timeoutId) {
-					vs = [];
 					clearTimeout(timeoutId);
 					timeoutId = null;
 				}

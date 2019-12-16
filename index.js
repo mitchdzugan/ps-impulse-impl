@@ -1,272 +1,455 @@
 "use strict";
-let lock = { then: f => f() };
-let releaseLock = () => {};
-const takeLock = () => {
-	lock = new Promise(resolve => { releaseLock = resolve; lock = { then: f => f() }; });
+
+let nextId = 1;
+const mkEventJS = (onRequired = () => () => {}) => {
+	const id = nextId;
+	nextId = id + 1;
+	return {
+		id,
+		nextSubscriberId: 0,
+		subscribers: {},
+		consumerCount: 0,
+		onRequired,
+		offCallback() {},
+	};
+};
+let pushCount = 0;
+const pushJS = (value) => (event) => {
+	const { subscribers } = event;
+	pushCount++;
+	Object.values(subscribers).forEach(handler => handler(value, pushCount));
+};
+const consumeJS = (f) => (event) => {
+	const { nextSubscriberId } = event;
+	if (!event.consumerCount) {
+		event.offCallback = event.onRequired(
+			(value) => pushJS(value)(event)
+		);
+	}
+	event.consumerCount += 1;
+	const subscriberId = nextSubscriberId;
+	event.nextSubscriberId = subscriberId + 1;
+	event.subscribers[subscriberId] = f;
+	return () => {
+		if (event.subscribers[subscriberId]) {
+			event.consumerCount -= 1;
+			if (!event.consumerCount) {
+				event.offCallback();
+			}
+			delete event.subscribers[subscriberId];
+		}
+	};
 };
 
-const makeEvent = (on = () => () => {}) => {
-	// TODO
-	// maybe use this for a perf optimization
-	// unused for now for simplicity
-	// let isDone = false;
-	// TODO
-	// maybe use this to allow clients to
-	// handle errors how they wish. Unused
-	// for now for simplicity.
-	// let error = undefined;
-	let nextSubId = 0;
-	let ons = new Set();
-	let subs = {};
 
-	const clear = () => {
-		ons = new Set();
-		subs = {};
+// -- mkEvent :: forall a. ((a -> Effect Unit) -> Effect (Effect Unit)) -> Event a
+const mkEvent = (onRequired = () => () => () => () => {}) => mkEventJS(pushSelf => onRequired(v => () => pushSelf(v))());
+
+// -- push :: forall a. a -> Event a -> Effect Unit
+const push = (value) => (event) => () => pushJS(value)(event);
+
+// -- consume :: forall a. (a -> Effect Unit) -> Event a -> Effect (Effect Unit)
+const consume = (f) => (event) => () => consumeJS(v => f(v)())(event);
+
+// -- rebuildBy :: forall a b. (a -> Array b) -> Event a -> Event b
+const rebuildBy = (toNexts) => (event) =>{
+	return mkEventJS(
+		(pushSelf) => consumeJS(
+			(curr) => toNexts(curr).forEach(pushSelf)
+		)(event)
+	);
+};
+
+// -- fmap :: forall a b. (a -> b) -> Event a -> Event b
+const fmap = (f) => (event) => (
+	rebuildBy(v => [f(v)])(event)
+);
+
+// -- filter :: forall a. (a -> Boolean) -> Event a -> Event a
+const filter = (pred) => (event) => (
+	rebuildBy(v => pred(v) ? [v] : [])(event)
+);
+
+// -- reduce :: forall a b. (a -> b -> a) -> a -> Event b -> Event a
+const reduce = (reducer) => (init) => (event) => {
+	let agg = init;
+	return rebuildBy((curr) => {
+		agg = reducer(agg)(curr);
+		return [agg];
+	})(event);
+};
+
+// -- flatMap :: forall a b. (a -> Event b) -> Event a -> Event b
+const flatMap = (toEvent) => (event) => {
+	let currOff = () => {};
+	let fullOff = () => {};
+	return mkEventJS(
+		(pushSelf) => {
+			fullOff = consumeJS((curr) => {
+				currOff();
+				const innerE = toEvent(curr);
+				currOff = consumeJS(pushSelf)(innerE);
+			})(event);
+			return () => {
+				currOff();
+				fullOff();
+				currOff = () => {};
+				fullOff = () => {};
+			};
+		}
+	);
+};
+
+// -- join :: forall a. Array (Event a) -> Event a
+const join = (events) => {
+	const maxPushCountById = {};
+	return mkEventJS(
+		(pushSelf) => {
+			const offs = events.map(event => consumeJS((value, pushCount) => {
+				const maxPushCount = maxPushCountById[event.id] || 0;
+				if (pushCount <= maxPushCount) {
+					console.log('skipping due to out of order');
+					return;
+				}
+				maxPushCountById[event.id] = pushCount;
+				pushSelf(value);
+			})(event));
+			return () => { offs.map(off => off()); };
+		}
+	);
+};
+
+// -- dedupImpl :: forall a. (a -> a -> Boolean) -> Event a -> Event a
+const dedupImpl = (eq) => (event) => {
+	let isFirst = true;
+	let prev;
+	return mkEventJS(
+		(pushSelf) => {
+			const off = consumeJS((curr) => {
+				if (isFirst || !eq(prev)(curr)) {
+					pushSelf(curr);
+					prev = curr;
+				}
+				isFirst = false;
+			})(event);
+			return () => { off(); isFirst = true; };
+		}
+	);
+};
+
+// -- never :: forall a. Event a
+const never = mkEventJS(() => {
+	never.subscribers = {};
+	return () => {
+		never.subscribers = {};
 	};
+});
 
-	const listen = (f) => {
-		const subId = nextSubId++;
-		subs[subId] = f;
-		return () => {
-			const off = on();
-			ons.add(subId);
-			subs[subId] = f;
+// -- preempt :: forall a b. (b -> Event a) -> (Event a -> b) -> b
+const preempt = (e_fromRes) => (f) => {
+	let p_eResolve = () => {};
+	const p_e = new Promise(
+		(resolve) => { p_eResolve = resolve; }
+	);
+	let p_off = new Promise(resolve => resolve());
+	const res = f(
+		mkEventJS(
+			(pushSelf) => {
+				p_off = p_e.then((event) => consumeJS(pushSelf)(event));
+				return () => {
+					p_off.then((off) => off());
+					p_off = new Promise(resolve => resolve());
+				};
+			}
+		)
+	);
+	p_eResolve(e_fromRes(res));
+	return res;
+};
+
+// -- timer :: Int -> Event Int
+const timer = (ms) => mkEventJS(
+	(pushSelf) => {
+		let count = 1;
+		const id = setInterval(
+			() => { pushSelf(count); count++; },
+			ms
+		);
+		return () => clearInterval(id);
+	}
+);
+
+// -- debounce :: forall a. Int -> Event a -> Event a
+const debounce = (ms) => (event) => {
+	let timeoutId;
+	return mkEventJS(
+		(pushSelf) => {
+			const off = consumeJS(
+				(v) => {
+					if (timeoutId) {
+						clearTimeout(timeoutId);
+					}
+					timeoutId = setTimeout(
+						() => pushSelf(v),
+						ms
+					);
+				}
+			)(event);
 			return () => {
 				off();
-				ons.delete(subId);
-				delete subs[subId];
-			};
-		};
-	};
-	const consume = f => listen(f)();
-	const push = (a) => {
-		ons.forEach(id => subs[id](a));
-	};
-
-	const helper = (f) => {
-		let e = { push: () => {} };
-		let onCount = 0;
-		let off = () => {};
-		const on = listen(v => f(v, e.push));
-		e = makeEvent(() => {
-			if (!onCount) {
-				off = on();
-			}
-			onCount++;
-			return () => {
-				onCount--;
-				if (!onCount) {
-					off();
+				if (timeoutId) {
+					clearTimeout(timeoutId);
+					timeoutId = null;
 				}
 			};
-		});
-		return e;
-	};
-
-	const fmap = f => helper((v, push) => push(f(v)));
-	const filter = f => helper((v, push) => f(v) && push(v));
-	const reduce = (f, init) => {
-		let acc = init;
-		return helper((v, push) => {
-			acc = f(acc)(v);
-			push(acc);
-		});
-	};
-	const flatMap = (f) => {
-		let e = { push: () => {} };
-		let onCount = 0;
-		let innerOff = () => {};
-		let innerOn = () => () => {};
-		let outerOff = () => {};
-		const outerOn = listen(inner => {
-			const isConsuming = onCount > 0;
-			if (isConsuming) {
-				innerOff();
-			}
-			const ires = f(inner);
-			// TODO what the actual fuck
-			innerOn = ires.listen && ires.listen(v => e.push(v));
-			if (isConsuming) {
-				innerOff = innerOn ? innerOn() : (() => {});
-			}
-		});
-		e = makeEvent(() => {
-			if (!onCount) {
-				outerOff = outerOn();
-				innerOff = innerOn();
-			}
-			onCount++;
-			return () => {
-				onCount--;
-				if (!onCount) {
-					innerOff();
-					outerOff();
-				}
-			};
-		});
-		return e;
-	};
-
-	return {
-		listen,
-		consume,
-		push,
-		fmap,
-		filter,
-		reduce,
-		flatMap,
-		clear,
-		mapEff: helper
-	};
-};
-
-const adaptEvent = (sub, unsub) => {
-	let e = { push: () => {} };
-	let onCount = 0;
-	let subRes;
-	e = makeEvent(() => {
-		if (!onCount) {
-			subRes = sub(v => e.push(v));
 		}
-		onCount++;
-		return () => {
-			onCount--;
-			if (!onCount) {
-				unsub(subRes);
-			}
-		};
-	});
-	return e;
+	);
 };
 
-const joinEvents = (...events) => {
-	let e = { push: () => {} };
-	let onCount = 0;
-	let offs = [];
-	const ons = events.map(inner => inner.listen(v => e.push(v)));
-	e = makeEvent(() => {
-		if (!onCount) {
-			offs = ons.map(on => on());
-		}
-		onCount++;
-		return () => {
-			onCount--;
-			if (!onCount) {
-				offs.forEach(off => off());
-			}
-		};
-	});
-	return e;
-};
-
-let nextSigId = 0
-const makeSignal = (event, init) => {
-	const sigId = nextSigId++;
-	let nextConsId = 1;
-	let cons = {};
-	let onCount = 0;
-	let off = () => false;
-	let val = init;
-
-
-	const stateful = { res: {} };
-
-	const changed = event
-		.fmap(v => {
-			if (onCount === 0) {
-				return { skip: true };
-			}
-			if (val == v || val === v) {
-				return { skip: true };
-			}
-			val = v;
-			return { val: v };
-		})
-				.filter(({ skip }) => {
-					if (onCount === 0 && !skip) {
-						console.log('isReallyBad');
+// -- throttle :: forall a. Int -> Event a -> Event a
+const throttle = (ms) => (event) => {
+	let timeoutId;
+	let latest;
+	return mkEventJS(
+		(pushSelf) => {
+			const off = consumeJS(
+				(v) => {
+					latest = v;
+					if (!timeoutId) {
+						timeoutId = setTimeout(
+							() => {
+								timeoutId = null;
+								return pushSelf(latest);
+							},
+							ms
+						);
 					}
-					return !skip ;
-				})
-		.fmap(({ val }) => val);
-
-	let unwrappedOff = () => {};
-	const masterCons = val => {
-		Object.values(cons).forEach(f => f(val));
-	};
-	const consume = (f) => {
-		const consId = nextConsId++;
-		cons[consId] = f;
-		onCount += 1;
-		const res = f(val);
-		// console.log({ onCount, sigId, consId });
-		if (onCount === 1) {
-			// console.log('on!!', { onCount, sigId, consId });
-			unwrappedOff = changed.consume(masterCons);
+				}
+			)(event);
+			return () => {
+				off();
+				if (timeoutId) {
+					clearTimeout(timeoutId);
+					timeoutId = null;
+				}
+			};
 		}
-		off = () => {
-			onCount -= 1;
-			delete cons[consId];
-			// console.log({ onCount, sigId, consId });
-			if (onCount === 0) {
-				// console.log('off!!', { onCount, sigId, consId });
-				unwrappedOff();
-				return true;
+	);
+};
+
+// -- tagWith :: forall a b c. (a -> b -> c) -> Event a -> Event b -> c -> Event c
+const tagWith = (f) => (tagged) => (tagger) => {
+	let taggerVal;
+	let hasTaggerVal = false;
+	return mkEventJS(
+		(pushSelf) => {
+			const off1 = consumeJS((tv => {
+				taggerVal = tv;
+				hasTaggerVal = true;
+			}))(tagger);
+			const off2 = consumeJS((taggedVal) => {
+				if (!hasTaggerVal) {
+					return;
+				}
+				pushSelf(f(taggedVal)(taggerVal));
+			})(tagged);
+			return () => { off1(); off2(); };
+		}
+	);
+};
+
+///////////////////////////////////////////
+
+let nextSigBuilderId = 1;
+const sigBuilders = {};
+
+const mkSigBuilder = () => ({ destroys: [] });
+
+// -- s_destroy :: forall a. Signal a -> Effect Unit
+const s_destroy = (s) => () => s.destroy();
+
+// -- s_subRes :: forall a. SubRes a -> a
+const s_subRes = ({ res }) => res;
+
+// -- s_unsub :: forall a. SubRes a -> Effect Unit
+const s_unsub = ({ off }) => () => off();
+
+// -- s_sub :: forall a b. (a -> Effect b) -> Signal a -> Effect (SubRes b)
+const s_sub = (f) => (s) => () => s.sub(val => f(val)());
+
+// -- s_inst :: forall a. Signal a -> Effect a
+const s_inst = s => () => s.getVal();
+
+// -- s_changed :: forall a. Signal a -> Event.Event a
+const s_changed = ({ changed }) => changed;
+
+// -- s_tagWith :: forall a b c. (a -> b -> c) -> Event.Event a -> Signal b -> Event.Event c
+const s_tagWith = (f) => (e) => (s) => fmap((a) => f(a)(s.getVal()))(e);
+
+// -- s_fromImpl :: forall a. Event.Event a -> a -> SigClass -> Signal a
+let sigOns = 0;
+let sigOffs = 0;
+const s_fromImpl = (changed) => (init) => (id) => {
+	let subs = {};
+	let nextSubId = 1;
+	let isDestroyed = false;
+	let val = init;
+	sigOns++;
+	// console.log({ sigOns, sigOffs });
+	const off = consumeJS(
+		(curr) => {
+			if (isDestroyed) {
+				return;
 			}
-			return false;
+			val = curr;
+			Object.values(subs).forEach((handler) => handler(val));
+		}
+	)(changed);
+	const getVal = () => val;
+	const sub = (f) => {
+		if (isDestroyed) {
+			return f(val);
+		}
+
+		const subId = nextSubId;
+		nextSubId++;
+		subs[subId] = f;
+		const res = f(val);
+		const off = () => {
+			delete subs[subId];
 		};
 		return { res, off };
 	};
-
-	const getVal = () => val;
-	const tagEvent = e => e.fmap(() => val);
-	const dedup = (areEq) => (
-		makeSignal(
-			changed
-				.reduce(
-					({ prev }) => curr => (
-						areEq(prev, curr) ? { skip: true, prev } : { curr, prev: curr }
-					),
-					{ prev: val },
-				)
-				.filter(({ skip }) => !skip)
-				.fmap(({ curr }) => curr),
-			val,
-		)
-	);
-	const fmap = (f) => makeSignal(changed.fmap(f), f(val));
-	const flatMap = (fs) => {
-		const initS = fs(val);
-		const init = initS.getVal();
-		const initChanged = initS.changed;
-		const changes = changed.fmap(inner => fs(inner).getVal());
-		const updates = changed.flatMap(inner => fs(inner).changed);
-		const event = joinEvents(initChanged, changes, updates);
-		return makeSignal(event, init);
+	const destroy = () => {
+		sigOffs++;
+		// console.log({ sigOffs, sigOns });
+		off();
+		subs = {};
+		isDestroyed = true;
 	};
 
-	consume(() => {});
-	stateful.res = {
-		off,
-		consume,
+	const sigBuilder = sigBuilders[id];
+	sigBuilder.destroys.push(destroy);
+
+	return {
+		destroy,
 		getVal,
 		changed,
-		tagEvent,
-		dedup,
-		fmap,
-		flatMap,
+		sub
 	};
-	return stateful.res;
 };
 
-const zipWith = (f, ...signals) => {
-	const getVal = () => f(...signals.map(s => s.getVal()));
-	const event = joinEvents(...signals.map(s => s.changed)).fmap(getVal);
-	return makeSignal(event, getVal());
+// -- s_fmapImpl :: forall a b. (a -> b) -> Signal a -> SigClass -> Signal b
+const s_fmapImpl = (f) => (s) => (
+	s_fromImpl(fmap(f)(s.changed))(f(s.getVal()))
+);
+
+// -- s_constImpl :: forall a. a -> SigClass -> Signal a
+const s_constImpl = (v) => s_fromImpl(never)(v);
+
+// -- s_zipWithImpl :: forall a b c. (a -> b -> c) -> Signal a -> Signal b -> SigClass -> Signal c
+const s_zipWithImpl = (f) => (s1) => (s2) => (
+	s_fromImpl(
+		fmap(
+			() => f(s1.getVal())(s2.getVal())
+		)(
+			join([s1.changed, s2.changed])
+		)
+	)(
+		f(s1.getVal())(s2.getVal())
+	)
+);
+
+// -- s_flattenImpl :: forall a. Signal (Signal a) -> SigClass -> Signal a
+const s_flattenImpl = (ss) => (
+	s_fromImpl(
+		join([
+			flatMap(({ changed }) => changed)(ss.changed),
+			fmap(({ getVal }) => getVal(), ss.changed),
+			ss.getVal().changed
+		])
+	)(ss.getVal().getVal())
+);
+
+// -- s_dedupImpl :: forall a. (a -> a -> Boolean) -> Signal a -> SigClass -> Signal a
+const s_dedupImpl = (eq) => (s) => (id) => {
+	let prev;
+	let isFirst = true;
+	return s_fromImpl(
+		filter(
+			(val) => {
+				if (isFirst) {
+					isFirst = false;
+					prev = val;
+					return true;
+				}
+
+				if (val == prev || eq(val)(prev)) {
+					return false;
+				}
+
+				prev = val;
+				return true;
+			}
+		)(s.changed)
+	)(s.getVal())(id);
 };
 
-exports.makeEvent = makeEvent;
-exports.makeSignal = makeSignal;
-exports.joinEvents = joinEvents;
-exports.adaptEvent = adaptEvent;
-exports.zipWith = zipWith;
+// -- s_buildImpl :: forall a. (SigClass -> Signal a) -> SigBuild a
+const s_buildImpl = f => () => {
+	const sigBuilderId = nextSigBuilderId;
+	nextSigBuilderId++;
+	sigBuilders[sigBuilderId] = mkSigBuilder();
+	const signal = f(sigBuilderId);
+	const sigBuilder = sigBuilders[sigBuilderId];
+	const destroys = sigBuilder.destroys;
+	const destroy = () => (
+		destroys.forEach(destroy => destroy())
+	);
+	delete sigBuilders[sigBuilderId];
+	return { destroy, signal };
+};
+
+// -- sigBuildToRecordImpl ::
+//      forall a.
+//      (Effect Unit -> Signal a -> { destroy :: Effect Unit, signal :: Signal a }) ->
+//      SigBuild a ->
+//      Effect { destroy :: Effect Unit, signal :: Signal a }
+const sigBuildToRecordImpl = (toRecord) => (sbf) => () => {
+	const { destroy, signal } = sbf();
+	return toRecord(destroy, signal);
+};
+
+///////////////////////////////////////////
+
+exports.mkEvent = mkEvent;
+exports.push = push;
+exports.consume = consume;
+exports.rebuildBy = rebuildBy;
+exports.fmap = fmap;
+exports.filter = filter;
+exports.reduce = reduce;
+exports.flatMap = flatMap;
+exports.join = join;
+exports.dedupImpl = dedupImpl;
+exports.preempt = preempt;
+exports.never = never;
+exports.tagWith = tagWith;
+exports.timer = timer;
+exports.debounce = debounce;
+exports.throttle = throttle;
+exports.s_destroy = s_destroy;
+exports.s_subRes = s_subRes;
+exports.s_unsub = s_unsub;
+exports.s_sub = s_sub;
+exports.s_inst = s_inst;
+exports.s_changed = s_changed;
+exports.s_tagWith = s_tagWith;
+exports.s_fromImpl = s_fromImpl;
+exports.s_fmapImpl = s_fmapImpl;
+exports.s_constImpl = s_constImpl;
+exports.s_zipWithImpl = s_zipWithImpl;
+exports.s_flattenImpl = s_flattenImpl;
+exports.s_dedupImpl = s_dedupImpl;
+exports.s_buildImpl = s_buildImpl;
+exports.sigBuildToRecordImpl = sigBuildToRecordImpl;

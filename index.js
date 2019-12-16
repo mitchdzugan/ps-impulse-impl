@@ -13,9 +13,11 @@ const mkEventJS = (onRequired = () => () => {}) => {
 		offCallback() {},
 	};
 };
+let pushCount = 0;
 const pushJS = (value) => (event) => {
 	const { subscribers } = event;
-	Object.values(subscribers).forEach(handler => handler(value));
+	pushCount++;
+	Object.values(subscribers).forEach(handler => handler(value, pushCount));
 };
 const consumeJS = (f) => (event) => {
 	const { nextSubscriberId } = event;
@@ -80,24 +82,38 @@ const reduce = (reducer) => (init) => (event) => {
 // -- flatMap :: forall a b. (a -> Event b) -> Event a -> Event b
 const flatMap = (toEvent) => (event) => {
 	let currOff = () => {};
+	let fullOff = () => {};
 	return mkEventJS(
-		(pushSelf) => consumeJS((curr) => {
-			currOff();
-			const innerE = toEvent(curr);
-			currOff = consumeJS(pushSelf)(innerE);
+		(pushSelf) => {
+			fullOff = consumeJS((curr) => {
+				currOff();
+				const innerE = toEvent(curr);
+				currOff = consumeJS(pushSelf)(innerE);
+			})(event);
 			return () => {
 				currOff();
+				fullOff();
 				currOff = () => {};
+				fullOff = () => {};
 			};
-		})(event)
+		}
 	);
 };
 
 // -- join :: forall a. Array (Event a) -> Event a
 const join = (events) => {
+	const maxPushCountById = {};
 	return mkEventJS(
 		(pushSelf) => {
-			const offs = events.map(event => consumeJS(pushSelf)(event));
+			const offs = events.map(event => consumeJS((value, pushCount) => {
+				const maxPushCount = maxPushCountById[event.id] || 0;
+				if (pushCount <= maxPushCount) {
+					console.log('skipping due to out of order');
+					return;
+				}
+				maxPushCountById[event.id] = pushCount;
+				pushSelf(value);
+			})(event));
 			return () => { offs.map(off => off()); };
 		}
 	);
@@ -120,7 +136,12 @@ const dedupImpl = (eq) => (event) => {
 };
 
 // -- never :: forall a. Event a
-const never = mkEventJS();
+const never = mkEventJS(() => {
+	never.subscribers = {};
+	return () => {
+		never.subscribers = {};
+	};
+});
 
 // -- preempt :: forall a b. (b -> Event a) -> (Event a -> b) -> b
 const preempt = (e_fromRes) => (f) => {
@@ -128,14 +149,14 @@ const preempt = (e_fromRes) => (f) => {
 	const p_e = new Promise(
 		(resolve) => { p_eResolve = resolve; }
 	);
-	let p_off = new Promise();
+	let p_off = new Promise(resolve => resolve());
 	const res = f(
 		mkEventJS(
 			(pushSelf) => {
 				p_off = p_e.then((event) => consumeJS(pushSelf)(event));
 				return () => {
 					p_off.then((off) => off());
-					p_off = new Promise();
+					p_off = new Promise(resolve => resolve());
 				};
 			}
 		)
@@ -267,11 +288,15 @@ const s_changed = ({ changed }) => changed;
 const s_tagWith = (f) => (e) => (s) => fmap((a) => f(a)(s.getVal()))(e);
 
 // -- s_fromImpl :: forall a. Event.Event a -> a -> SigClass -> Signal a
+let sigOns = 0;
+let sigOffs = 0;
 const s_fromImpl = (changed) => (init) => (id) => {
 	let subs = {};
 	let nextSubId = 1;
 	let isDestroyed = false;
 	let val = init;
+	sigOns++;
+	// console.log({ sigOns, sigOffs });
 	const off = consumeJS(
 		(curr) => {
 			if (isDestroyed) {
@@ -297,6 +322,8 @@ const s_fromImpl = (changed) => (init) => (id) => {
 		return { res, off };
 	};
 	const destroy = () => {
+		sigOffs++;
+		// console.log({ sigOffs, sigOns });
 		off();
 		subs = {};
 		isDestroyed = true;
@@ -310,8 +337,8 @@ const s_fromImpl = (changed) => (init) => (id) => {
 		getVal,
 		changed,
 		sub
-	}
-}
+	};
+};
 
 // -- s_fmapImpl :: forall a b. (a -> b) -> Signal a -> SigClass -> Signal b
 const s_fmapImpl = (f) => (s) => (

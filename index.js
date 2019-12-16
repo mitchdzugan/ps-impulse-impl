@@ -417,7 +417,7 @@ const s_buildImpl = f => () => {
 //      Effect { destroy :: Effect Unit, signal :: Signal a }
 const sigBuildToRecordImpl = (toRecord) => (sbf) => () => {
 	const { destroy, signal } = sbf();
-	return toRecord(destroy, signal);
+	return toRecord(destroy)(signal);
 };
 
 ///////////////////////////////////////////

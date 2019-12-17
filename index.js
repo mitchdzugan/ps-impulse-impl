@@ -237,6 +237,36 @@ const throttle = (ms) => (event) => {
 	);
 };
 
+const deferOff = (ms) => (event) => {
+	let softOn = false;
+	let isOn = false;
+	let offFn = () => {};
+	return mkEventJS(
+		(pushSelf) => {
+			softOn = true;
+			if (!isOn) {
+				offFn = consumeJS(pushSelf)(event)
+				isOn = true;
+			}
+			return () => {
+				softOn = false;
+				setTimeout(
+					() => {
+						if (softOn) {
+							return;
+						}
+
+						isOn = false;
+						offFn();
+						offFn = () => {};
+					}, 
+					ms
+				);
+			};
+		}
+	)
+}
+
 // -- tagWith :: forall a b c. (a -> b -> c) -> Event a -> Event b -> c -> Event c
 const tagWith = (f) => (tagged) => (tagger) => {
 	let taggerVal;
@@ -438,6 +468,7 @@ exports.tagWith = tagWith;
 exports.timer = timer;
 exports.debounce = debounce;
 exports.throttle = throttle;
+exports.deferOff = deferOff;
 exports.s_destroy = s_destroy;
 exports.s_subRes = s_subRes;
 exports.s_unsub = s_unsub;
